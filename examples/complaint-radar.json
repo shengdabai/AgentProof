@@ -1,0 +1,36 @@
+{
+  "commands": [
+    {
+      "name": "Python unit tests",
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
+      "timeout": 180
+    },
+    {
+      "name": "Python syntax",
+      "argv": ["python3", "-m", "py_compile", "bin/analyze.py", "bin/collect.py", "bin/filter.py", "bin/monthly_archive.py", "bin/render_fallback.py"],
+      "timeout": 60
+    },
+    {
+      "name": "Shell syntax",
+      "argv": ["bash", "-n", "bin/analyze.sh", "bin/on_demand.sh", "bin/push_feishu.sh", "bin/render_image.sh", "bin/run_daily.sh", "bin/run_monthly_archive.sh"],
+      "timeout": 60
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "2026-08-26 complaint radar image",
+      "path": "data/images/2026-08-26.png",
+      "min_bytes": 10000,
+      "image": {
+        "min_width": 1200,
+        "min_height": 2000
+      }
+    },
+    {
+      "name": "2026-08-26 evidence digest",
+      "path": "data/digest/2026-08-26-digest.md",
+      "min_bytes": 5000
+    }
+  ]
+}
+
