@@ -109,7 +109,10 @@ def merge_sensitive_patterns(*groups: Any) -> list[str]:
 
 
 def iter_project_entries(project: Path, excludes: set[str]) -> Iterable[Path]:
-    for root, dirs, files in os.walk(project, topdown=True, followlinks=False):
+    def scan_failed(exc: OSError) -> None:
+        raise AgentProofError(f"cannot scan project directory: {exc}") from exc
+
+    for root, dirs, files in os.walk(project, topdown=True, followlinks=False, onerror=scan_failed):
         dirs[:] = sorted(d for d in dirs if d not in excludes)
         root_path = Path(root)
         for name in sorted(files):
@@ -134,8 +137,8 @@ def scan_project(
         try:
             rel = path.relative_to(project).as_posix()
             stat = path.lstat()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise AgentProofError(f"cannot inspect project entry: {path}") from exc
         sensitive = path_is_sensitive(rel, sensitive_patterns)
         item: dict[str, Any] = {
             "type": "symlink" if path.is_symlink() else "file",
@@ -162,7 +165,7 @@ def scan_project(
                     shutil.copy2(path, destination)
                     item["backup"] = f"files/{rel}"
             except OSError as exc:
-                item["error"] = str(exc)
+                raise AgentProofError(f"cannot read or back up project entry: {rel}") from exc
         else:
             item["note"] = f"metadata only; file exceeds {max_hash_bytes} bytes"
         entries[rel] = item
@@ -207,9 +210,18 @@ def snapshot_project(
         raise AgentProofError(f"project directory does not exist: {project}")
     if output.exists():
         raise AgentProofError(f"snapshot output already exists: {output}")
-    output.mkdir(parents=True)
+    # An output directory visited by the scan would recursively copy itself.
+    try:
+        output_relative = output.relative_to(project)
+    except ValueError:
+        output_relative = None
+    if output_relative is not None and not any(
+        part in DEFAULT_EXCLUDES for part in output_relative.parts
+    ):
+        raise AgentProofError("snapshot output inside project must be under an excluded directory (e.g. .agentproof)")
     # Custom rules may extend, but must never disable the built-in protection.
     patterns = merge_sensitive_patterns(sensitive_patterns or [])
+    output.mkdir(parents=True)
     entries = scan_project(
         project,
         sensitive_patterns=patterns,
@@ -340,10 +352,11 @@ def image_dimensions(path: Path) -> tuple[int, int] | None:
 
 def run_command_check(project: Path, check: dict[str, Any]) -> dict[str, Any]:
     project = project.resolve()
-    name = str(check.get("name") or "unnamed command")
+    name = redact(str(check.get("name") or "unnamed command"))
     argv = check.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
         return {"name": name, "passed": False, "error": "argv must be a non-empty string list"}
+    public_argv = [redact(arg) for arg in argv]
     cwd = safe_project_path(project, str(check.get("cwd") or "."))
     timeout = max(1, min(int(check.get("timeout", 120)), 1800))
     started = time.monotonic()
@@ -360,7 +373,7 @@ def run_command_check(project: Path, check: dict[str, Any]) -> dict[str, Any]:
         )
         return {
             "name": name,
-            "argv": argv,
+            "argv": public_argv,
             "cwd": str(cwd.relative_to(project)),
             "passed": result.returncode == 0,
             "exit_code": result.returncode,
@@ -371,7 +384,7 @@ def run_command_check(project: Path, check: dict[str, Any]) -> dict[str, Any]:
     except subprocess.TimeoutExpired as exc:
         return {
             "name": name,
-            "argv": argv,
+            "argv": public_argv,
             "passed": False,
             "error": f"timed out after {timeout}s",
             "duration_seconds": round(time.monotonic() - started, 3),
@@ -379,7 +392,7 @@ def run_command_check(project: Path, check: dict[str, Any]) -> dict[str, Any]:
             "stderr_tail": redact(exc.stderr or ""),
         }
     except OSError as exc:
-        return {"name": name, "argv": argv, "passed": False, "error": str(exc)}
+        return {"name": name, "argv": public_argv, "passed": False, "error": redact(str(exc))}
 
 
 def check_artifact(
@@ -436,7 +449,7 @@ def check_artifact(
 def load_config(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AgentProofError(f"invalid config: {exc}") from exc
     if not isinstance(data, dict):
         raise AgentProofError("config must be a JSON object")
@@ -445,6 +458,37 @@ def load_config(path: Path) -> dict[str, Any]:
     for field in ("commands", "artifacts"):
         if not all(isinstance(check, dict) for check in data.get(field, [])):
             raise AgentProofError(f"{field} entries must be JSON objects")
+    for check in data.get("commands", []):
+        argv = check.get("argv")
+        if (not isinstance(argv, list) or not argv
+                or not all(isinstance(x, str) and "\x00" not in x for x in argv) or not argv[0]):
+            raise AgentProofError("command argv must be a non-empty string list without NUL bytes")
+        cwd = check.get("cwd", ".")
+        if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+            raise AgentProofError("command cwd must be a non-empty path string without NUL bytes")
+        timeout = check.get("timeout", 120)
+        if type(timeout) is not int or timeout < 1:
+            raise AgentProofError("command timeout must be a positive integer")
+    for check in data.get("artifacts", []):
+        relative = check.get("path")
+        if not isinstance(relative, str) or not relative or "\x00" in relative:
+            raise AgentProofError("artifact path must be a non-empty path string without NUL bytes")
+        minimum = check.get("min_bytes", 1)
+        if type(minimum) is not int or minimum < 0:
+            raise AgentProofError("artifact min_bytes must be a non-negative integer")
+        expected_sha = check.get("sha256")
+        if expected_sha is not None and (
+            not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+        ):
+            raise AgentProofError("artifact sha256 must be a lowercase SHA-256 digest")
+        if "image" in check:
+            image = check["image"]
+            if not isinstance(image, dict):
+                raise AgentProofError("artifact image rules must be an object")
+            for field in ("min_width", "min_height"):
+                value = image.get(field, 1)
+                if type(value) is not int or value < 1:
+                    raise AgentProofError(f"artifact {field} must be a positive integer")
     merge_sensitive_patterns(data.get("sensitive_patterns", []))
     return data
 
@@ -492,10 +536,15 @@ table{{width:100%;border-collapse:collapse;background:var(--panel);border-radius
 
 def verify_project(project: Path, baseline_path: Path, config_path: Path, output_dir: Path) -> dict[str, Any]:
     project = project.resolve()
+    if not project.is_dir():
+        raise AgentProofError(f"project directory does not exist: {project}")
     manifest_path, manifest = load_manifest(baseline_path)
     config = load_config(config_path)
     patterns = merge_sensitive_patterns(manifest.get("sensitive_patterns", []), config.get("sensitive_patterns", []))
     limits = manifest.get("limits") or {}
+    command_results = [run_command_check(project, x) for x in config.get("commands", [])]
+    artifact_results = [check_artifact(project, x, patterns=patterns) for x in config.get("artifacts", [])]
+    # Commands may create, modify or delete sensitive files. Inspect their final state.
     current = scan_project(
         project,
         sensitive_patterns=patterns,
@@ -508,8 +557,6 @@ def verify_project(project: Path, baseline_path: Path, config_path: Path, output
         for rel in changes["added"] + changes["modified"] + changes["deleted"]
         if path_is_sensitive(rel, patterns)
     )
-    command_results = [run_command_check(project, x) for x in config.get("commands", [])]
-    artifact_results = [check_artifact(project, x, patterns=patterns) for x in config.get("artifacts", [])]
     commands_pass = all(x["passed"] for x in command_results)
     artifacts_pass = all(x["passed"] for x in artifact_results)
     passed = commands_pass and artifacts_pass and not sensitive_changes
@@ -534,9 +581,23 @@ def verify_project(project: Path, baseline_path: Path, config_path: Path, output
     }
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    (output_dir / "report.html").write_text(render_html_report(report), encoding="utf-8")
+    write_report_file(output_dir / "report.json", json.dumps(report, ensure_ascii=False, indent=2))
+    write_report_file(output_dir / "report.html", render_html_report(report))
     return report
+
+
+def write_report_file(target: Path, content: str) -> None:
+    """Replace the report entry without following pre-existing symlinks/hardlinks."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent,
+                                         prefix=".agentproof-report-", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def restore_file_path(root: Path, relative: str) -> Path:

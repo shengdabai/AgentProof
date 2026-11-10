@@ -15,6 +15,137 @@ def tiny_png(width: int, height: int) -> bytes:
 
 
 class AgentProofTests(unittest.TestCase):
+    def test_verify_scans_changes_after_commands_finish(self):
+        for action in ("create", "modify", "delete"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                project = root / "project"
+                project.mkdir()
+                target = project / "private.txt"
+                if action != "create":
+                    target.write_text("before")
+                baseline = root / "snapshot"
+                agentproof.snapshot_project(project, baseline, sensitive_patterns=["private.txt"])
+                operation = "p.unlink()" if action == "delete" else "p.write_text('changed')"
+                config = root / "checks.json"
+                config.write_text(json.dumps({"commands": [{"argv": [sys.executable, "-c",
+                    "from pathlib import Path; p=Path('private.txt'); " + operation]}]}))
+                report = agentproof.verify_project(project, baseline, config, root / "report")
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["sensitive_changes"], ["private.txt"])
+                self.assertTrue(report["commands"][0]["passed"])
+
+    def test_snapshot_rejects_output_that_would_scan_itself(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            output = project / "snapshots" / "new"
+            with self.assertRaises(agentproof.AgentProofError):
+                agentproof.snapshot_project(project, output)
+            self.assertFalse(output.exists())
+            manifest = agentproof.snapshot_project(project, project / ".agentproof" / "snapshot")
+            self.assertEqual(json.loads(manifest.read_text())["entries"], {})
+
+    def test_scan_errors_cannot_produce_partial_snapshot(self):
+        for failure in ("walk", "stat", "hash"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                project = root / "project"
+                project.mkdir()
+                (project / "data.txt").write_text("data")
+                def failed_walk(*args, **kwargs):
+                    kwargs["onerror"](PermissionError("walk denied"))
+                    return iter(())
+                if failure == "walk":
+                    mocked = patch.object(agentproof.os, "walk", side_effect=failed_walk)
+                elif failure == "stat":
+                    mocked = patch.object(agentproof.Path, "lstat", side_effect=PermissionError("stat denied"))
+                else:
+                    mocked = patch.object(agentproof, "sha256_file", side_effect=PermissionError("hash denied"))
+                with mocked, self.assertRaises(agentproof.AgentProofError):
+                    agentproof.snapshot_project(project, root / "snapshot")
+                self.assertFalse((root / "snapshot/manifest.json").exists())
+
+    def test_verify_rejects_missing_project_before_running_commands(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            baseline = root / "snapshot"
+            agentproof.snapshot_project(project, baseline)
+            project.rmdir()
+            config = root / "checks.json"
+            config.write_text('{}')
+            with patch.object(agentproof, "run_command_check", side_effect=AssertionError("must not run")):
+                with self.assertRaises(agentproof.AgentProofError):
+                    agentproof.verify_project(project, baseline, config, root / "report")
+
+    def test_report_writes_do_not_follow_symlinks_or_hardlinks(self):
+        for link_type in ("symlink", "hardlink"):
+            with self.subTest(link_type=link_type), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                project = root / "project"
+                project.mkdir()
+                baseline = root / "snapshot"
+                agentproof.snapshot_project(project, baseline)
+                config = root / "checks.json"
+                config.write_text('{}')
+                report_dir = root / "report"
+                report_dir.mkdir()
+                victim = root / "unrelated.txt"
+                victim.write_text("must survive")
+                for name in ("report.json", "report.html"):
+                    if link_type == "symlink":
+                        (report_dir / name).symlink_to(victim)
+                    else:
+                        os.link(victim, report_dir / name)
+                report = agentproof.verify_project(project, baseline, config, report_dir)
+                self.assertTrue(report["passed"])
+                self.assertEqual(victim.read_text(), "must survive")
+                self.assertFalse((report_dir / "report.json").is_symlink())
+
+    def test_config_rejects_invalid_check_fields_before_execution(self):
+        invalid_commands = [{"argv": ["echo", "\x00"]}, {"argv": "echo ok"},
+                            {"argv": [""]}, {"argv": ["echo"], "timeout": "bad"},
+                            {"argv": ["echo"], "timeout": False},
+                            {"argv": ["echo"], "cwd": []}]
+        invalid_artifacts = [{"path": "data.txt", "min_bytes": "bad"}, {"path": 42},
+                             {"path": "data.txt", "image": []},
+                             {"path": "data.txt", "image": {"min_width": -1}},
+                             {"path": "data.txt", "sha256": 42}]
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "checks.json"
+            for field, checks in (("commands", invalid_commands), ("artifacts", invalid_artifacts)):
+                for check in checks:
+                    with self.subTest(field=field, check=check):
+                        config.write_text(json.dumps({field: [check]}))
+                        with self.assertRaises(agentproof.AgentProofError):
+                            agentproof.load_config(config)
+
+    def test_invalid_utf8_config_has_controlled_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "checks.json"
+            config.write_bytes(b"\xff")
+            with self.assertRaises(agentproof.AgentProofError):
+                agentproof.load_config(config)
+
+    def test_command_evidence_redacts_arguments_in_all_exit_paths(self):
+        token = "sk-" + "synthetic-test-value"
+        for outcome in ("success", "timeout", "error"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temp:
+                argv = [sys.executable, "-c", "pass", token]
+                if outcome == "success":
+                    result = agentproof.run_command_check(Path(temp), {"name": token, "argv": argv})
+                    self.assertTrue(result["passed"])
+                else:
+                    failure = (agentproof.subprocess.TimeoutExpired(argv, 1) if outcome == "timeout"
+                               else OSError("cannot start " + token))
+                    with patch.object(agentproof.subprocess, "run", side_effect=failure) as run:
+                        result = agentproof.run_command_check(Path(temp), {"name": token, "argv": argv})
+                    self.assertEqual(run.call_args.args[0], argv)
+                    self.assertFalse(result["passed"])
+                self.assertNotIn(token, json.dumps(result))
+                self.assertEqual(result["argv"][-1], "[REDACTED]")
+
     def restore_fixture(self, root):
         project = root / "project"
         project.mkdir()
